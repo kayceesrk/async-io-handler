@@ -67,12 +67,10 @@ let block_accept st fd k =
       seq
   in
   node := Lwt_sequence.add_r (fun () -> 
-    if !node != dummy then
-      (Lwt_sequence.remove !node; 
-       node := dummy;
-       (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-       let res = Unix.accept fd in
-       Queue.push (fun () -> continue k res) st.run_q)) seq
+    Lwt_sequence.remove !node; 
+    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
+    let res = Unix.accept fd in
+    Queue.push (fun () -> continue k res) st.run_q) seq
 
 let block_recv st fd buf pos len mode k =
   let node = ref dummy in
@@ -85,12 +83,10 @@ let block_recv st fd buf pos len mode k =
       seq
   in
   node := Lwt_sequence.add_r (fun () -> 
-    if !node != dummy then
-      (Lwt_sequence.remove !node; 
-       node := dummy;
-       (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-       let res = Unix.recv fd buf pos len mode in
-       Queue.push (fun () -> continue k res) st.run_q)) seq
+    Lwt_sequence.remove !node; 
+    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
+    let res = Unix.recv fd buf pos len mode in
+    Queue.push (fun () -> continue k res) st.run_q) seq
 
 let block_send st fd buf pos len mode k =
   let node = ref dummy in
@@ -103,12 +99,10 @@ let block_send st fd buf pos len mode k =
       seq
   in
   node := Lwt_sequence.add_r (fun () -> 
-    if !node != dummy then
-      (Lwt_sequence.remove !node; 
-       node := dummy;
-       (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-       let res = Unix.send fd buf pos len mode in
-       Queue.push (fun () -> continue k res) st.run_q)) seq
+    Lwt_sequence.remove !node; 
+    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
+    let res = Unix.send fd buf pos len mode in
+    Queue.push (fun () -> continue k res) st.run_q) seq
 
 let block_sleep st delay k =
   ignore @@ Lwt_engine.on_timer delay false (fun ev -> 
