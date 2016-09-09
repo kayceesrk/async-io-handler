@@ -10,15 +10,27 @@ type file_descr = Unix.file_descr
 type sockaddr = Unix.sockaddr
 type msg_flag = Unix.msg_flag
 
-effect Fork  : (unit -> unit) -> unit
+type 'a status =
+  | Done of 'a
+  | Error of exn
+  | Waiting of ('a, unit) continuation list
+
+type 'a promise = 'a status ref
+
+effect Async : ('a -> 'b) * 'a -> 'b promise
+effect Await : 'a promise -> 'a
 effect Yield : unit
+
 effect Accept : file_descr -> (file_descr * sockaddr)
 effect Recv : file_descr * bytes * int * int * msg_flag list -> int
 effect Send : file_descr * bytes * int * int * msg_flag list -> int
 effect Sleep : float -> unit
 
-let fork f =
-  perform (Fork f)
+let async f v =
+  perform (Async (f, v))
+
+let await p =
+  perform (Await p)
 
 let yield () =
   perform Yield
@@ -34,6 +46,8 @@ let send fd bus pos len mode =
 
 let sleep timeout =
   perform (Sleep timeout)
+
+let mk_status () = ref (Waiting [])
 
 external poll_rd : Unix.file_descr -> bool = "lwt_unix_readable"
 external poll_wr : Unix.file_descr -> bool = "lwt_unix_writable"
@@ -138,22 +152,50 @@ and perform_io st =
   clean st;
   schedule st
 
+let finish st sr v =
+  match !sr with
+  | Waiting l ->
+      sr := Done v;
+      List.iter (fun k ->
+        Queue.push (fun () -> continue k v) st.run_q) l
+  | _ -> failwith "Impossible: finish"
+
+let abort st sr e =
+  match !sr with
+  | Waiting l ->
+      sr := Error e;
+      List.iter (fun k ->
+        Queue.push (fun () -> discontinue k e) st.run_q) l
+  | _ -> failwith "Impossible: abort"
+
+let force st sr k =
+  match !sr with
+  | Done v -> continue k v
+  | Error e -> discontinue k e
+  | Waiting l -> 
+      sr := Waiting (k::l); 
+      schedule st
+
 let run main =
   let st = init () in
-  let rec fork st f =
+  let rec fork : 'a. state -> 'a promise -> (unit -> 'a) -> unit = fun st sr f ->
     match f () with
-    | () -> schedule st
-    | exception exn ->
-        print_string (Printexc.to_string exn);
+    | v -> finish st sr v; schedule st
+    | exception e ->
+        print_string (Printexc.to_string e);
+        abort st sr e;
         schedule st
     | effect Yield  k ->
         Queue.push (continue k) st.run_q;
         schedule st
-    | effect (Fork f) k ->
-        Queue.push (continue k) st.run_q;
-        fork st f
+    | effect (Async (f, v)) k ->
+        let sr = mk_status () in
+        Queue.push (fun () -> continue k sr) st.run_q;
+        fork st sr (fun () -> f v)
+    | effect (Await sr) k -> force st sr k
     | effect (Accept fd) k ->
         if poll_rd fd then begin
+          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
           let res = Unix.accept fd in
           continue k res
         end else begin
@@ -162,6 +204,7 @@ let run main =
         end
     | effect (Recv (fd, buf, pos, len, mode)) k ->
         if poll_rd fd then begin
+          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
           let res = Unix.recv fd buf pos len mode in
           continue k res
         end else begin
@@ -170,6 +213,7 @@ let run main =
         end
     | effect (Send (fd, buf, pos, len, mode)) k ->
         if poll_wr fd then begin
+          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
           let res = Unix.send fd buf pos len mode in
           continue k res
         end else begin
@@ -183,4 +227,5 @@ let run main =
           schedule st
         end
   in
-  fork st main
+  let sr = mk_status () in
+  fork st sr main

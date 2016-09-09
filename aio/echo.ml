@@ -88,7 +88,7 @@ let server () =
       let cn = string_of_sockaddr client_addr in
       printf "server : client (%s) connected.\n%!" cn;
       Unix.set_nonblock client_sock;
-      Aio.fork (fun () -> echo_server client_sock client_addr)
+      ignore @@ Aio.async (echo_server client_sock) client_addr
     done
   with
   | _ -> close ssock
