@@ -6,6 +6,8 @@
  * transparent to the programmer.
  *)
 
+(* Type declarations *)
+
 type file_descr = Unix.file_descr
 type sockaddr = Unix.sockaddr
 type msg_flag = Unix.msg_flag
@@ -25,6 +27,13 @@ effect Accept : file_descr -> (file_descr * sockaddr)
 effect Recv : file_descr * bytes * int * int * msg_flag list -> int
 effect Send : file_descr * bytes * int * int * msg_flag list -> int
 effect Sleep : float -> unit
+
+type state =
+  { run_q    : (unit -> unit) Queue.t;
+    read_ht  : (file_descr, Lwt_engine.event * (unit -> unit) Lwt_sequence.t) Hashtbl.t;
+    write_ht : (file_descr, Lwt_engine.event * (unit -> unit) Lwt_sequence.t) Hashtbl.t; }
+
+(* Wrappers for performing effects *)
 
 let async f v =
   perform (Async (f, v))
@@ -47,81 +56,7 @@ let send fd bus pos len mode =
 let sleep timeout =
   perform (Sleep timeout)
 
-let mk_status () = ref (Waiting [])
-
-external poll_rd : Unix.file_descr -> bool = "lwt_unix_readable"
-external poll_wr : Unix.file_descr -> bool = "lwt_unix_writable"
-
-type state =
-  { run_q    : (unit -> unit) Queue.t;
-    read_ht  : (file_descr, Lwt_engine.event * (unit -> unit) Lwt_sequence.t) Hashtbl.t;
-    write_ht : (file_descr, Lwt_engine.event * (unit -> unit) Lwt_sequence.t) Hashtbl.t; }
-
-let init () =
-  { run_q = Queue.create ();
-    read_ht = Hashtbl.create 13;
-    write_ht = Hashtbl.create 13 }
-
-let register_readable fd seq = 
-    Lwt_engine.on_readable fd (fun _ -> Lwt_sequence.iter_l (fun f -> f ()) seq)
-
-let register_writable fd seq = 
-    Lwt_engine.on_writable fd (fun _ -> Lwt_sequence.iter_l (fun f -> f ()) seq)
-
-let dummy = Lwt_sequence.add_r ignore (Lwt_sequence.create ())
-
-let block_accept st fd k =
-  let node = ref dummy in
-  let seq =
-    try snd @@ Hashtbl.find st.read_ht fd
-    with Not_found -> 
-      let seq = Lwt_sequence.create () in
-      let ev = register_readable fd seq in
-      Hashtbl.add st.read_ht fd (ev, seq);
-      seq
-  in
-  node := Lwt_sequence.add_r (fun () -> 
-    Lwt_sequence.remove !node; 
-    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-    let res = Unix.accept fd in
-    Queue.push (fun () -> continue k res) st.run_q) seq
-
-let block_recv st fd buf pos len mode k =
-  let node = ref dummy in
-  let seq =
-    try snd @@ Hashtbl.find st.read_ht fd
-    with Not_found -> 
-      let seq = Lwt_sequence.create () in
-      let ev = register_readable fd seq in
-      Hashtbl.add st.read_ht fd (ev, seq);
-      seq
-  in
-  node := Lwt_sequence.add_r (fun () -> 
-    Lwt_sequence.remove !node; 
-    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-    let res = Unix.recv fd buf pos len mode in
-    Queue.push (fun () -> continue k res) st.run_q) seq
-
-let block_send st fd buf pos len mode k =
-  let node = ref dummy in
-  let seq =
-    try snd @@ Hashtbl.find st.write_ht fd
-    with Not_found -> 
-      let seq = Lwt_sequence.create () in
-      let ev = register_writable fd seq in
-      Hashtbl.add st.write_ht fd (ev, seq);
-      seq
-  in
-  node := Lwt_sequence.add_r (fun () -> 
-    Lwt_sequence.remove !node; 
-    (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-    let res = Unix.send fd buf pos len mode in
-    Queue.push (fun () -> continue k res) st.run_q) seq
-
-let block_sleep st delay k =
-  ignore @@ Lwt_engine.on_timer delay false (fun ev -> 
-    Lwt_engine.stop_event ev; 
-    Queue.push (continue k) st.run_q)
+(* IO loop *)
 
 let clean st =
   let clean_ht ht = 
@@ -152,6 +87,69 @@ and perform_io st =
   clean st;
   schedule st
 
+(* Syscall wrappers *)
+
+type syscall_kind = 
+  | Read 
+  | Write
+
+external poll_rd : Unix.file_descr -> bool = "lwt_unix_readable"
+external poll_wr : Unix.file_descr -> bool = "lwt_unix_writable"
+
+let register_readable fd seq = 
+    Lwt_engine.on_readable fd (fun _ -> Lwt_sequence.iter_l (fun f -> f ()) seq)
+
+let register_writable fd seq = 
+    Lwt_engine.on_writable fd (fun _ -> Lwt_sequence.iter_l (fun f -> f ()) seq)
+
+let poll_syscall fd kind action =
+  try
+    if (kind = Read && poll_rd fd) || (kind = Write && poll_wr fd) then
+      Some (action ())
+    else None
+  with
+  | Unix.Unix_error((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _)
+  | Sys_blocked_io -> None
+
+let dummy = Lwt_sequence.add_r ignore (Lwt_sequence.create ())
+
+let rec block_syscall st fd kind action k =
+  let node = ref dummy in
+  let ht,register = 
+    match kind with
+    | Read -> st.read_ht, register_readable
+    | Write -> st.write_ht, register_writable
+  in
+  let seq = 
+    try snd @@ Hashtbl.find ht fd
+    with Not_found ->
+      let seq = Lwt_sequence.create () in
+      let ev = register fd seq in
+      Hashtbl.add ht fd (ev, seq);
+      seq
+  in
+  node := Lwt_sequence.add_r (fun () ->
+    Lwt_sequence.remove !node;
+    match poll_syscall fd kind action with
+    | Some res -> Queue.push (fun () -> continue k res) st.run_q
+    | None -> block_syscall st fd kind action k) seq
+
+let do_syscall st fd kind action k =
+  match poll_syscall fd kind action with
+  | Some res -> continue k res
+  | None -> 
+      block_syscall st fd kind action k;
+      schedule st
+
+let block_sleep st delay k =
+  ignore @@ Lwt_engine.on_timer delay false (fun ev -> 
+    Lwt_engine.stop_event ev; 
+    Queue.push (continue k) st.run_q)
+
+(* Promises *)
+
+let mk_status () = ref (Waiting [])
+
 let finish st sr v =
   match !sr with
   | Waiting l ->
@@ -176,6 +174,13 @@ let force st sr k =
       sr := Waiting (k::l); 
       schedule st
 
+(* Main handler loop *)
+
+let init () =
+  { run_q = Queue.create ();
+    read_ht = Hashtbl.create 13;
+    write_ht = Hashtbl.create 13 }
+
 let run main =
   let st = init () in
   let rec fork : 'a. state -> 'a promise -> (unit -> 'a) -> unit = fun st sr f ->
@@ -194,32 +199,14 @@ let run main =
         fork st sr (fun () -> f v)
     | effect (Await sr) k -> force st sr k
     | effect (Accept fd) k ->
-        if poll_rd fd then begin
-          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-          let res = Unix.accept fd in
-          continue k res
-        end else begin
-          block_accept st fd k;
-          schedule st
-        end
+        let action () = Unix.accept fd in
+        do_syscall st fd Read action k
     | effect (Recv (fd, buf, pos, len, mode)) k ->
-        if poll_rd fd then begin
-          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-          let res = Unix.recv fd buf pos len mode in
-          continue k res
-        end else begin
-          block_recv st fd buf pos len mode k;
-          schedule st
-        end
+        let action () = Unix.recv fd buf pos len mode in
+        do_syscall st fd Read action k
     | effect (Send (fd, buf, pos, len, mode)) k ->
-        if poll_wr fd then begin
-          (* Fixme: Might block. See lwt_unix.ml for non-blocking implementation. *)
-          let res = Unix.send fd buf pos len mode in
-          continue k res
-        end else begin
-          block_send st fd buf pos len mode k;
-          schedule st
-        end
+        let action () = Unix.send fd buf pos len mode in
+        do_syscall st fd Write action k
     | effect (Sleep t) k ->
         if t <= 0. then continue k ()
         else begin
